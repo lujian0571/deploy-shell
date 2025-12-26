@@ -12,6 +12,14 @@
 set -euo pipefail
 
 #######################################
+# SSH 相关配置（可自定义）
+#######################################
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_rsa}"     # 私钥路径
+SSH_USER="${SSH_USER:-root}"                # 默认 SSH 用户
+SSH_PORT_DEFAULT="${SSH_PORT_DEFAULT:-22}"  # 默认端口
+SSH_STRICT_CHECKING="${SSH_STRICT_CHECKING:-no}" # 是否严格校验 host key
+
+#######################################
 # 基本参数
 #######################################
 
@@ -170,7 +178,7 @@ debug() {
 # 提示用户输入并返回输入值
 # 参数: $1 - 提示信息，$2 - 提示颜色
 prompt_input() {
-    local message="${1:-请输入序号或字符进行匹配（/ 重置列表）:}"  # 默认提示语
+    local message="${1:-请输入序号或字符进行匹配（/ 重置, q 退出）:}"  # 默认提示语
     local color="${2:-$YELLOW}"
     local input
     # 显示带颜色的提示并读取用户输入
@@ -395,27 +403,25 @@ parse_server() {
     local server_str="$1"
     SERVER_NAME=""        # 重置服务器名
     SERVER_IP=""          # 重置服务器IP
-    SERVER_PORT="22"      # 重置并设置默认端口为22
-    USERNAME="root"       # 重置并设置默认用户名为root
+    SERVER_PORT="${SSH_PORT_DEFAULT:-22}"  # 使用顶部默认端口
+    USERNAME="${SSH_USER:-root}"           # 使用顶部默认用户
 
     # 使用正则表达式解析服务器字符串
     # 格式: [name-][user@]host[:port]
     if [[ "$server_str" =~ ^(([a-zA-Z0-9_-]+)-)?(([a-zA-Z0-9_-]+)@)?([a-zA-Z0-9.-]+)(:([0-9]+))?$ ]]; then
         # BASH_REMATCH[2]: 服务器别名部分
         [[ -n "${BASH_REMATCH[2]}" ]] && SERVER_NAME="${BASH_REMATCH[2]}"
-        # BASH_REMATCH[4]: 用户名部分
+        # BASH_REMATCH[4]: 用户名部分，如果存在覆盖默认
         [[ -n "${BASH_REMATCH[4]}" ]] && USERNAME="${BASH_REMATCH[4]}"
         # BASH_REMATCH[5]: IP地址部分
         SERVER_IP="${BASH_REMATCH[5]}"
-        # BASH_REMATCH[7]: 端口号部分
+        # BASH_REMATCH[7]: 端口号部分，如果存在覆盖默认
         [[ -n "${BASH_REMATCH[7]}" ]] && SERVER_PORT="${BASH_REMATCH[7]}"
     else
-        # 如果无法解析，输出警告并返回错误
         warn "无法解析服务器配置: $server_str"
         return 1
     fi
 
-    # 输出解析结果的调试信息
     debug "解析服务器: ${USERNAME}@${SERVER_IP}:${SERVER_PORT}${SERVER_NAME:+ ($SERVER_NAME)}"
 }
 
@@ -445,7 +451,8 @@ select_server() {
 # 执行rsync同步操作
 # 参数: $1 - 是否为dry-run模式（"true"表示预览，其他值表示实际同步）
 run_rsync() {
-    local dry_run="${1:-false}"  # 默认为非dry-run模式
+    local dir="$1"         # 必须传入环境目录
+    local dry_run="${2:-false}"  # 默认为非dry-run模式
     # 定义rsync选项
     # -a: 归档模式，保持文件属性
     # -v: 详细输出
@@ -456,7 +463,9 @@ run_rsync() {
     # --no-perms: 不保留权限
     # --no-owner: 不保留所有者
     # --no-group: 不保留组
-    local rsync_opts=(-avziP --delete --no-perms --no-owner --no-group --exclude-from="$IGNORE_FILE" -e "ssh -p $SERVER_PORT")
+    local rsync_opts=(-avziP --delete --no-perms --no-owner --no-group \
+        --exclude-from="$IGNORE_FILE" \
+        -e "ssh -i ${SSH_KEY} -p ${SERVER_PORT:-$SSH_PORT_DEFAULT} -o StrictHostKeyChecking=${SSH_STRICT_CHECKING}")
 
     # 定义源目录：当前环境目录和公共目录
     local src_dirs=("$dir/" "$BASE_DIR/common/")
@@ -465,7 +474,7 @@ run_rsync() {
 
     # 如果是dry-run模式，只预览将要执行的操作
     if [[ "$dry_run" == "true" ]]; then
-        rsync "${rsync_opts[@]}" --dry-run "${src_dirs[@]}" "$dest" | tee /dev/tty
+        rsync "${rsync_opts[@]}" --dry-run --itemize-changes "${src_dirs[@]}" "$dest"
         return
     fi
 
@@ -484,8 +493,9 @@ remote_execute_script() {
     # 构建远程脚本的完整路径
     local remote_path="${TARGET_DIR}/${script_path}"
     warn ">>> 远程执行脚本: $remote_path ${script_args}"  # 输出执行信息
-    # 通过SSH执行远程脚本
-    ssh -t -p "$SERVER_PORT" "${USERNAME}@${SERVER_IP}" "bash $remote_path $script_args"
+    # SSH 执行远程脚本
+    ssh -i "${SSH_KEY}" -o StrictHostKeyChecking="${SSH_STRICT_CHECKING}" \
+        -t -p "${SERVER_PORT:-$SSH_PORT_DEFAULT}" "${SSH_USER}@${SERVER_IP}" "bash $remote_path $script_args"
     info ">>> 脚本执行完成"  # 输出完成信息
 }
 
@@ -516,20 +526,25 @@ publish_files() {
     echo -e "${TITLE_COLOR}目标目录:${RESET} ${CONTENT_COLOR}$TARGET_DIR${RESET}"
     echo -e "${GRAY}=======================================${RESET}"
 
-    # 运行dry-run模式获取将要同步的文件列表
-    DRY_OUTPUT=$(run_rsync true)
+    # 临时文件存 dry-run 输出
+    tmpfile=$(mktemp)
+    # 运行 dry-run，实时输出到屏幕，同时保存到临时文件
+    run_rsync "$dir" true | tee "$tmpfile"
+
     # 检查dry-run输出是否包含文件变更（><c分别表示：传输、删除、变更）
-    if echo "$DRY_OUTPUT" | grep -q '^[><c]'; then
+    if grep -q '^[><c]' "$tmpfile"; then
         # 如果设置了自动确认标志则跳过确认，否则要求用户确认
         $ARF_YES_FLAG || confirm_or_exit
         warn ">>> rsync 正式同步"  # 提示开始正式同步
-        run_rsync false  # 执行实际的同步操作
+        run_rsync "$dir" false  # 执行实际的同步操作
 
         # 如果定义了初始化脚本，则在远程执行
         [ -n "${INIT_SCRIPT:-}" ] && remote_execute_script "$INIT_SCRIPT"
     else
         warn ">>> 没有文件变动，跳过同步确认"  # 没有文件需要同步
     fi
+    # 删除临时文件
+    rm -f "$tmpfile"
 }
 
 
